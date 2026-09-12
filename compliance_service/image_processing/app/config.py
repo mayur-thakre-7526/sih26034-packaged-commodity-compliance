@@ -34,8 +34,7 @@ class Settings:
     ROI_CONFIDENCE_THRESHOLD: float = 0.35
 
     # --- Storage ---
-    OBJECT_STORE_BUCKET: str = os.environ.get("OBJECT_STORE_BUCKET", "lm-compliance-scans")
-    OBJECT_STORE_ENDPOINT: str = os.environ.get("OBJECT_STORE_ENDPOINT", "http://localhost:9000")
+    # Cloud storage has been dropped
 
 
 settings = Settings()
