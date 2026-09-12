@@ -9,11 +9,17 @@ export const getDashboardOverview = async (req, res, next) => {
 
     if (countError) throw countError;
 
-    // 2. Get all scans for aggregated stats
-    const { data: scans, error: scansError } = await supabase
+    // 2. Get scans for aggregated stats (filtered by role)
+    let query = supabase
       .from('scans')
       .select('*, products(product_name, brand_name)')
       .order('created_at', { ascending: false });
+
+    if (req.user.role === 'inspector') {
+      query = query.eq('user_id', req.user.id);
+    }
+
+    const { data: scans, error: scansError } = await query;
 
     if (scansError) throw scansError;
 

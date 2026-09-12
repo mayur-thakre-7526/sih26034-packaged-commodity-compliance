@@ -143,11 +143,16 @@ export const getScan = async (req, res, next) => {
   try {
     const { id } = req.params;
 
-    const { data, error } = await supabase
+    let query = supabase
       .from('scans')
       .select('*')
-      .eq('id', id)
-      .single();
+      .eq('id', id);
+
+    if (req.user.role === 'inspector') {
+      query = query.eq('user_id', req.user.id);
+    }
+
+    const { data, error } = await query.single();
 
     if (error || !data) {
       const err = new Error('Scan not found');
@@ -170,6 +175,11 @@ export const getScans = async (req, res, next) => {
       .from('scans')
       .select('id, product_id, status, created_at, result, products!inner(product_name, brand_name)')
       .order('created_at', { ascending: false });
+
+    if (req.user.role === 'inspector') {
+      query = query.eq('user_id', req.user.id);
+    }
+
 
     if (search) {
       query = query.or(`product_name.ilike.%${search}%,brand_name.ilike.%${search}%`, { foreignTable: 'products' });
@@ -207,11 +217,16 @@ export const getScanReport = async (req, res, next) => {
     const { id } = req.params;
 
     // 1 & 2 & 3 & 4. Fetch scan, product, user
-    const { data: scan, error: scanError } = await supabase
+    let query = supabase
       .from('scans')
       .select('*, products(product_name, brand_name, generic_name), users(name)')
-      .eq('id', id)
-      .single();
+      .eq('id', id);
+
+    if (req.user.role === 'inspector') {
+      query = query.eq('user_id', req.user.id);
+    }
+
+    const { data: scan, error: scanError } = await query.single();
 
     if (scanError || !scan) {
       const err = new Error('Scan not found');
