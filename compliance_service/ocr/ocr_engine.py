@@ -1,20 +1,12 @@
-"""Thin wrapper around EasyOCR. Owns nothing about Legal Metrology
+"""Thin wrapper around PaddleOCR (via rapidocr-onnxruntime). Owns nothing about Legal Metrology
 rules -- just turns a rectified label image into structured OCR output
 (lines of text with bounding boxes and confidence). `extraction.py` is
 what knows about MRP/net-quantity/etc. patterns.
 
-Kept deliberately separate from extraction.py so the OCR engine itself
-(EasyOCR today) can be swapped for PaddleOCR/Tesseract/a cloud OCR API
-later without touching any Legal Metrology parsing logic -- this is the
-same OCRLine/OCRResult/run_ocr contract the pytesseract version used, so
-extraction.py requires no changes for this swap.
-
-Why EasyOCR over pytesseract: meaningfully better accuracy on photographed
-packaging (small/dense print, curved surfaces, mixed English/Devanagari)
-than Tesseract, which is tuned for clean scanned documents. See the
-project discussion for the EasyOCR-vs-PaddleOCR trade-off -- EasyOCR was
-chosen here for lower install/environment risk (PyTorch-based, no separate
-framework install) at a small accuracy cost relative to PaddleOCR.
+Replaced EasyOCR with PaddleOCR (via rapidocr_onnxruntime to support modern python environments)
+for higher accuracy on photographed packaging. Includes a multi-pass pipeline 
+that tests original, upscaled, adaptive-thresholded, and CLAHE-enhanced variants,
+selecting the objectively strongest result based on OCR confidence.
 """
 from __future__ import annotations
 
@@ -23,8 +15,7 @@ from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
-import easyocr
-
+from rapidocr_onnxruntime import RapidOCR
 
 @dataclass
 class OCRLine:
@@ -45,29 +36,21 @@ class OCRResult:
         return line.y2 - line.y1
 
 
-# EasyOCR's Reader loads detection + recognition model weights on
-# construction, which is expensive (can be several seconds, plus a one-time
-# model download on first run) -- unlike pytesseract, which has no
-# comparable setup cost per call. Cache readers by language tuple across requests.
-_readers: dict[tuple[str, ...], "easyocr.Reader"] = {}
+# RapidOCR caches the onnx models intrinsically on instantiation.
+_reader: Optional["RapidOCR"] = None
 
-DEFAULT_LANGUAGES = ["en", "hi"]  # English + Hindi/Devanagari, per the
-                                   # multilingual-label requirement.
-
-
-def get_reader(languages: Optional[List[str]] = None) -> "easyocr.Reader":
-    """Returns a cached Reader for the given language set, constructing it
-    on first use. Pass gpu=True at construction if the deployment environment
-    has a CUDA GPU available -- CPU inference works but is noticeably slower."""
-    global _readers
-    langs = tuple(languages or DEFAULT_LANGUAGES)
-    if langs not in _readers:
-        _readers[langs] = easyocr.Reader(list(langs), gpu=False)
-    return _readers[langs]
+def get_reader() -> "RapidOCR":
+    """Returns a cached RapidOCR (PaddleOCR) engine, constructing it on first use."""
+    global _reader
+    if _reader is None:
+        # We enable use_angle_cls to detect and correct rotated text, 
+        # which is extremely common in package photographs.
+        _reader = RapidOCR(text_score=0.3)
+    return _reader
 
 
 def _polygon_to_bbox(polygon) -> Tuple[int, int, int, int]:
-    """EasyOCR returns each detection's box as a 4-point polygon (not
+    """RapidOCR returns each detection's box as a 4-point polygon (not
     necessarily axis-aligned, since text can be slightly rotated even after
     rectification). Collapse it to an axis-aligned bounding box, matching
     the OCRLine contract the rest of the pipeline (and font-size
@@ -77,103 +60,91 @@ def _polygon_to_bbox(polygon) -> Tuple[int, int, int, int]:
     return int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
 
 
-MAX_OCR_DIMENSION = 1600
-
-
-def downscale_image_for_ocr(
-    image_bgr: np.ndarray,
-    max_dimension: int = MAX_OCR_DIMENSION,
-) -> Tuple[np.ndarray, float]:
-    """Downscales image so max(width, height) <= max_dimension while preserving aspect ratio.
-
-    Returns:
-        A tuple of (downscaled_image, scale_factor), where scale_factor = downscaled / original.
-        If the image is already within max_dimension, returns (image_bgr, 1.0) without copying.
-    """
-    height, width = image_bgr.shape[:2]
-    longest_side = max(height, width)
-    if longest_side <= max_dimension:
-        return image_bgr, 1.0
-
-    scale = max_dimension / float(longest_side)
-    new_width = max(1, int(round(width * scale)))
-    new_height = max(1, int(round(height * scale)))
-    downscaled = cv2.resize(image_bgr, (new_width, new_height), interpolation=cv2.INTER_AREA)
-    return downscaled, scale
-
-
-def _is_meaningful_text(lines: List[OCRLine]) -> bool:
-    """Checks whether the OCR detections contain enough coherent content to
-    constitute a readable label, avoiding unnecessary fallback passes."""
-    if not lines:
-        return False
-    total_chars = sum(len(line.text.strip()) for line in lines if line.confidence >= 0.2)
-    return total_chars >= 6
+def _generate_variants(image_bgr: np.ndarray) -> List[Tuple[str, np.ndarray]]:
+    """Generate preprocessing variants for multi-pass OCR."""
+    variants = []
+    
+    # Pass 1: Base image (might already be enhanced by the upstream pipeline)
+    variants.append(("original", image_bgr))
+    
+    # Pass 2: Upscaled (helps PaddleOCR detect small MRP / net quantity text)
+    h, w = image_bgr.shape[:2]
+    upscaled = cv2.resize(image_bgr, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
+    variants.append(("upscaled_2x", upscaled))
+    
+    # Pass 3: Grayscale + CLAHE (helps with shadows, glare, colored backgrounds)
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    clahe_gray = clahe.apply(gray)
+    clahe_bgr = cv2.cvtColor(clahe_gray, cv2.COLOR_GRAY2BGR)
+    variants.append(("clahe", clahe_bgr))
+    
+    # Pass 4: Grayscale + Adaptive Thresholding (robust binarization for very low contrast text)
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 4)
+    thresh_bgr = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+    variants.append(("thresh", thresh_bgr))
+    
+    return variants
 
 
 def run_ocr(image_bgr: np.ndarray, languages: Optional[List[str]] = None) -> OCRResult:
-    """Runs EasyOCR on a rectified label image and returns structured line output.
-
-    Uses an adaptive multilingual approach:
-    - If languages are explicitly passed, uses that language reader directly.
-    - Otherwise, runs the fast English reader (['en']) first.
-    - If the English pass yields sufficient text, returns it immediately without
-      running OCR twice.
-    - If the English pass yields zero or negligible text, falls back to the
-      multilingual (['en', 'hi']) reader to capture Indian-language packaging.
+    """Runs PaddleOCR on a rectified label image using a multi-pass approach,
+    and returns line/phrase-level output, sorted top-to-bottom.
+    
+    Uses multiple preprocessing variants and picks the objectively strongest
+    result based on cumulative OCR confidence.
     """
-    ocr_image, scale = downscale_image_for_ocr(image_bgr)
-
-    def _execute_readtext(reader_instance: "easyocr.Reader") -> List[OCRLine]:
-        detections = reader_instance.readtext(
-            ocr_image,
-            detail=1,
-            paragraph=False,
-            canvas_size=MAX_OCR_DIMENSION,
-        )
-        detected_lines: List[OCRLine] = []
-        for polygon, text, confidence in detections:
+    reader = get_reader()
+    
+    variants = _generate_variants(image_bgr)
+    
+    best_result = None
+    best_score = -1.0
+    
+    for name, img in variants:
+        # RapidOCR returns a tuple: (result, elapse)
+        # result is None if no text is found.
+        # result format: [[[[x1,y1], [x2,y2], [x3,y3], [x4,y4]], "Text", confidence], ...]
+        detections, elapse = reader(img)
+        
+        if detections is None:
+            continue
+            
+        score = 0.0
+        lines: List[OCRLine] = []
+        
+        for item in detections:
+            polygon, text, confidence = item
             text = text.strip()
             if not text:
                 continue
+                
+            confidence = float(confidence)
+            
+            # Revert scaling for bounding boxes if we upscaled the image
+            if name == "upscaled_2x":
+                polygon = [[pt[0] / 2.0, pt[1] / 2.0] for pt in polygon]
+                
             x1, y1, x2, y2 = _polygon_to_bbox(polygon)
-
-            if scale != 1.0:
-                x1 = int(round(x1 / scale))
-                y1 = int(round(y1 / scale))
-                x2 = int(round(x2 / scale))
-                y2 = int(round(y2 / scale))
-
-                # Clamp coordinates to original image bounds
-                height, width = image_bgr.shape[:2]
-                x1 = max(0, min(width - 1, x1))
-                y1 = max(0, min(height - 1, y1))
-                x2 = max(0, min(width, x2))
-                y2 = max(0, min(height, y2))
-
-            detected_lines.append(OCRLine(
+            
+            lines.append(OCRLine(
                 text=text,
                 x1=x1, y1=y1, x2=x2, y2=y2,
-                confidence=round(float(confidence), 2),
+                confidence=round(confidence, 2)
             ))
-        return detected_lines
-
-    if languages is not None:
-        reader = get_reader(languages)
-        lines = _execute_readtext(reader)
-    else:
-        # Adaptive: try fast English first
-        reader_en = get_reader(["en"])
-        lines = _execute_readtext(reader_en)
-        # Fall back to multilingual Hindi reader only if English pass found virtually nothing
-        if not _is_meaningful_text(lines):
-            reader_multi = get_reader(["en", "hi"])
-            lines = _execute_readtext(reader_multi)
-
-    # Sort top-to-bottom (then left-to-right on ties) so full_text reads
-    # like the label, matching the ordering behaviour of the tesseract
-    # version (which sorted by block/par/line position).
-    lines.sort(key=lambda line: (line.y1, line.x1))
-
-    full_text = "\n".join(line.text for line in lines)
-    return OCRResult(lines=lines, full_text=full_text)
+            
+            # Cumulative score to reward both high confidence and high text recall
+            score += confidence
+            
+        if score > best_score:
+            best_score = score
+            
+            # Sort top-to-bottom (then left-to-right on ties) so full_text reads like the label
+            lines.sort(key=lambda line: (line.y1, line.x1))
+            full_text = "\n".join(line.text for line in lines)
+            best_result = OCRResult(lines=lines, full_text=full_text)
+            
+    if best_result is None:
+        best_result = OCRResult(lines=[], full_text="")
+        
+    return best_result
