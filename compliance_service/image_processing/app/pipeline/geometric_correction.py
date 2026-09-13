@@ -98,16 +98,31 @@ def correct_geometry(image_bgr: np.ndarray, boundary: BoundaryResult) -> Correct
             )
 
     if boundary.shape == PackageShape.CYLINDRICAL and boundary.ellipse is not None:
-        unwarped = _cylindrical_unwarp(image_bgr, boundary.ellipse)
-        if unwarped is not None:
-            return CorrectionResult(
-                image_bgr=unwarped,
-                flags=[QualityFlag.CURVED_SURFACE],
-                corrected=True,
-            )
+        (cx, cy), (d1, d2), angle = boundary.ellipse
+        height, width = image_bgr.shape[:2]
+        radius_px = max(d1, d2) / 2.0
+        # Conservative guardrail: cylindrical unwarping is only applied when the ellipse
+        # is well-formed, well within frame bounds, and has a plausible physical radius.
+        # If classification is uncertain or fit is abnormal, preserve the original image
+        # untouched rather than applying destructive warping.
+        is_safe = (
+            radius_px >= 30
+            and radius_px <= width * 1.2
+            and min(d1, d2) >= 20
+            and (-0.2 * width <= cx <= 1.2 * width)
+            and (-0.2 * height <= cy <= 1.2 * height)
+        )
+        if is_safe:
+            unwarped = _cylindrical_unwarp(image_bgr, boundary.ellipse)
+            if unwarped is not None:
+                return CorrectionResult(
+                    image_bgr=unwarped,
+                    flags=[QualityFlag.CURVED_SURFACE],
+                    corrected=True,
+                )
         return CorrectionResult(
             image_bgr=image_bgr,
-            flags=[QualityFlag.CURVED_SURFACE, QualityFlag.GEOMETRIC_CORRECTION_FAILED],
+            flags=[QualityFlag.CURVED_SURFACE],
             corrected=False,
         )
 

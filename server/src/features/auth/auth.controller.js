@@ -1,4 +1,5 @@
 import { supabase } from '../../config/supabase.js';
+import { createClient } from '@supabase/supabase-js';
 
 export const login = async (req, res, next) => {
   try {
@@ -8,8 +9,20 @@ export const login = async (req, res, next) => {
       return res.status(400).json({ error: 'Email and password are required' });
     }
 
-    // Authenticate with Supabase
-    const { data, error } = await supabase.auth.signInWithPassword({
+    // Authenticate with Supabase using an isolated client so the global admin client is not polluted
+    const authClient = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_PUBLISHABLE_KEY || process.env.SUPABASE_SECRET_KEY,
+      {
+        auth: {
+          autoRefreshToken: false,
+          persistSession: false,
+          detectSessionInUrl: false
+        }
+      }
+    );
+
+    const { data, error } = await authClient.auth.signInWithPassword({
       email,
       password
     });

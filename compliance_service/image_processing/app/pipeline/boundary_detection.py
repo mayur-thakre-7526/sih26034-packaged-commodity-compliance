@@ -92,9 +92,18 @@ def detect_boundary(image_bgr: np.ndarray) -> BoundaryResult:
         if aspect <= settings.MAX_ASPECT_DISTORTION:
             return BoundaryResult(shape=PackageShape.PLANAR, quadrilateral=quad, found=True)
 
-    # Not a clean quadrilateral -> try fitting an ellipse (bottle/jar/can case).
+    # Not a clean quadrilateral -> check if it fits an ellipse (bottle/jar/can case).
     if len(main_contour) >= 5:
         ellipse = cv2.fitEllipse(main_contour)
-        return BoundaryResult(shape=PackageShape.CYLINDRICAL, ellipse=ellipse, found=True)
+        (cx, cy), (d1, d2), angle = ellipse
+        e_area = np.pi * (d1 / 2.0) * (d2 / 2.0)
+        c_area = cv2.contourArea(main_contour)
+        # Conservative guardrail: only classify as CYLINDRICAL if the contour area
+        # reasonably matches the ellipse area (within 35%), characteristic of true
+        # round/curved cans, jars, and bottles. Planar packages (e.g. biscuit packets,
+        # rectangular boxes with wrinkled edges) deviate significantly and should not
+        # undergo destructive cylindrical warping.
+        if c_area > 0 and abs(c_area - e_area) / c_area <= 0.35:
+            return BoundaryResult(shape=PackageShape.CYLINDRICAL, ellipse=ellipse, found=True)
 
     return BoundaryResult(shape=PackageShape.UNKNOWN, found=False)

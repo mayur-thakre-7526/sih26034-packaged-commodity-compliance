@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import cv2
 import numpy as np
 import easyocr
 
@@ -47,10 +48,8 @@ class OCRResult:
 # EasyOCR's Reader loads detection + recognition model weights on
 # construction, which is expensive (can be several seconds, plus a one-time
 # model download on first run) -- unlike pytesseract, which has no
-# comparable setup cost per call. Build the reader once per language set
-# and reuse it across requests rather than constructing it per call.
-_reader: Optional["easyocr.Reader"] = None
-_reader_langs: Optional[List[str]] = None
+# comparable setup cost per call. Cache readers by language tuple across requests.
+_readers: dict[tuple[str, ...], "easyocr.Reader"] = {}
 
 DEFAULT_LANGUAGES = ["en", "hi"]  # English + Hindi/Devanagari, per the
                                    # multilingual-label requirement.
@@ -58,15 +57,13 @@ DEFAULT_LANGUAGES = ["en", "hi"]  # English + Hindi/Devanagari, per the
 
 def get_reader(languages: Optional[List[str]] = None) -> "easyocr.Reader":
     """Returns a cached Reader for the given language set, constructing it
-    on first use. Pass gpu=True at construction (edit below) if the
-    deployment environment has a CUDA GPU available -- CPU inference works
-    but is noticeably slower for EasyOCR than for Tesseract."""
-    global _reader, _reader_langs
-    languages = languages or DEFAULT_LANGUAGES
-    if _reader is None or _reader_langs != languages:
-        _reader = easyocr.Reader(languages, gpu=False)
-        _reader_langs = languages
-    return _reader
+    on first use. Pass gpu=True at construction if the deployment environment
+    has a CUDA GPU available -- CPU inference works but is noticeably slower."""
+    global _readers
+    langs = tuple(languages or DEFAULT_LANGUAGES)
+    if langs not in _readers:
+        _readers[langs] = easyocr.Reader(list(langs), gpu=False)
+    return _readers[langs]
 
 
 def _polygon_to_bbox(polygon) -> Tuple[int, int, int, int]:
@@ -80,42 +77,98 @@ def _polygon_to_bbox(polygon) -> Tuple[int, int, int, int]:
     return int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))
 
 
-def run_ocr(image_bgr: np.ndarray, languages: Optional[List[str]] = None) -> OCRResult:
-    """Runs EasyOCR on a rectified (post image_processing pipeline) label
-    image and returns line/phrase-level output, sorted top-to-bottom.
+MAX_OCR_DIMENSION = 1600
 
-    Expects the image to already be validated/boundary-corrected/enhanced
-    -- i.e. the output of image_processing.enhancement, not a raw photo.
 
-    Unlike Tesseract (word-level output that this module had to group into
-    lines via block/paragraph/line indices), EasyOCR's CRAFT-based detector
-    already groups nearby word regions into single text-line/phrase boxes,
-    so each detection from readtext() maps directly to one OCRLine -- no
-    separate grouping step is needed here.
+def downscale_image_for_ocr(
+    image_bgr: np.ndarray,
+    max_dimension: int = MAX_OCR_DIMENSION,
+) -> Tuple[np.ndarray, float]:
+    """Downscales image so max(width, height) <= max_dimension while preserving aspect ratio.
 
-    paragraph=False is used deliberately: EasyOCR's paragraph=True mode
-    merges multiple text lines into larger paragraph blocks, which would
-    lose the per-line bounding-box height that the font-size compliance
-    check (Rule 7) depends on.
+    Returns:
+        A tuple of (downscaled_image, scale_factor), where scale_factor = downscaled / original.
+        If the image is already within max_dimension, returns (image_bgr, 1.0) without copying.
     """
-    reader = get_reader(languages)
+    height, width = image_bgr.shape[:2]
+    longest_side = max(height, width)
+    if longest_side <= max_dimension:
+        return image_bgr, 1.0
 
-    # EasyOCR accepts BGR numpy arrays directly (it reads images via OpenCV
-    # internally), so no colour-space conversion is needed here, unlike the
-    # grayscale conversion the pytesseract version required.
-    detections = reader.readtext(image_bgr, detail=1, paragraph=False)
+    scale = max_dimension / float(longest_side)
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+    downscaled = cv2.resize(image_bgr, (new_width, new_height), interpolation=cv2.INTER_AREA)
+    return downscaled, scale
 
-    lines: List[OCRLine] = []
-    for polygon, text, confidence in detections:
-        text = text.strip()
-        if not text:
-            continue
-        x1, y1, x2, y2 = _polygon_to_bbox(polygon)
-        lines.append(OCRLine(
-            text=text,
-            x1=x1, y1=y1, x2=x2, y2=y2,
-            confidence=round(float(confidence), 2),
-        ))
+
+def _is_meaningful_text(lines: List[OCRLine]) -> bool:
+    """Checks whether the OCR detections contain enough coherent content to
+    constitute a readable label, avoiding unnecessary fallback passes."""
+    if not lines:
+        return False
+    total_chars = sum(len(line.text.strip()) for line in lines if line.confidence >= 0.2)
+    return total_chars >= 6
+
+
+def run_ocr(image_bgr: np.ndarray, languages: Optional[List[str]] = None) -> OCRResult:
+    """Runs EasyOCR on a rectified label image and returns structured line output.
+
+    Uses an adaptive multilingual approach:
+    - If languages are explicitly passed, uses that language reader directly.
+    - Otherwise, runs the fast English reader (['en']) first.
+    - If the English pass yields sufficient text, returns it immediately without
+      running OCR twice.
+    - If the English pass yields zero or negligible text, falls back to the
+      multilingual (['en', 'hi']) reader to capture Indian-language packaging.
+    """
+    ocr_image, scale = downscale_image_for_ocr(image_bgr)
+
+    def _execute_readtext(reader_instance: "easyocr.Reader") -> List[OCRLine]:
+        detections = reader_instance.readtext(
+            ocr_image,
+            detail=1,
+            paragraph=False,
+            canvas_size=MAX_OCR_DIMENSION,
+        )
+        detected_lines: List[OCRLine] = []
+        for polygon, text, confidence in detections:
+            text = text.strip()
+            if not text:
+                continue
+            x1, y1, x2, y2 = _polygon_to_bbox(polygon)
+
+            if scale != 1.0:
+                x1 = int(round(x1 / scale))
+                y1 = int(round(y1 / scale))
+                x2 = int(round(x2 / scale))
+                y2 = int(round(y2 / scale))
+
+                # Clamp coordinates to original image bounds
+                height, width = image_bgr.shape[:2]
+                x1 = max(0, min(width - 1, x1))
+                y1 = max(0, min(height - 1, y1))
+                x2 = max(0, min(width, x2))
+                y2 = max(0, min(height, y2))
+
+            detected_lines.append(OCRLine(
+                text=text,
+                x1=x1, y1=y1, x2=x2, y2=y2,
+                confidence=round(float(confidence), 2),
+            ))
+        return detected_lines
+
+    if languages is not None:
+        reader = get_reader(languages)
+        lines = _execute_readtext(reader)
+    else:
+        # Adaptive: try fast English first
+        reader_en = get_reader(["en"])
+        lines = _execute_readtext(reader_en)
+        # Fall back to multilingual Hindi reader only if English pass found virtually nothing
+        if not _is_meaningful_text(lines):
+            reader_multi = get_reader(["en", "hi"])
+            lines = _execute_readtext(reader_multi)
 
     # Sort top-to-bottom (then left-to-right on ties) so full_text reads
     # like the label, matching the ordering behaviour of the tesseract

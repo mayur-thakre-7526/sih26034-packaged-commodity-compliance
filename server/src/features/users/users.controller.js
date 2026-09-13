@@ -31,7 +31,8 @@ export const createUser = async (req, res, next) => {
         name,
         email,
         role,
-        is_active: true
+        is_active: true,
+        password_hash: 'supabase_auth'
       })
       .select()
       .single();

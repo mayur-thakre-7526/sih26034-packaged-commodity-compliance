@@ -1,6 +1,5 @@
 import { supabase } from '../../config/supabase.js';
 import PDFDocument from 'pdfkit';
-import { createClient } from '@supabase/supabase-js';
 
 export const createScan = async (req, res, next) => {
   try {
@@ -52,44 +51,53 @@ export const createScan = async (req, res, next) => {
     }
 
     const scanId = scanRecord.id;
-    const imageUrls = [];
 
-    // 4. Upload images to Supabase Storage
-    for (const file of files) {
-      const ext = file.originalname.split('.').pop() || 'jpg';
-      const safeFilename = `${Date.now()}-${Math.round(Math.random() * 1E9)}.${ext}`;
-      const filePath = `${scanId}/${safeFilename}`;
-      
-      // Ensure bucket exists using admin client
-      await supabase.storage.createBucket('scans', { public: true }).catch(() => {});
+    // 4. Upload images to Supabase Storage concurrently using privileged admin client
+    const uploadResults = await Promise.all(
+      files.map(async (file) => {
+        const ext = file.originalname.split('.').pop() || 'jpg';
+        const safeFilename = `${Date.now()}-${Math.round(Math.random() * 1E9)}.${ext}`;
+        const filePath = `${scanId}/${safeFilename}`;
 
-      const token = req.headers.authorization?.split(' ')[1];
-      const uploadClient = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_PUBLISHABLE_KEY, {
-        global: { headers: { Authorization: `Bearer ${token}` } }
-      });
+        const { error: uploadError } = await supabase.storage
+          .from('scans')
+          .upload(filePath, file.buffer, {
+            contentType: file.mimetype,
+            upsert: false
+          });
 
-      const { data: uploadData, error: uploadError } = await uploadClient.storage
-        .from('scans')
-        .upload(filePath, file.buffer, {
-          contentType: file.mimetype,
-          upsert: false
-        });
+        if (uploadError) {
+          return { error: uploadError, file, publicUrl: null };
+        }
 
-      if (uploadError) {
-        console.error('Supabase upload error, using placeholder:', uploadError.message);
-        imageUrls.push('https://via.placeholder.com/150'); // Mock URL to allow testing
-      } else {
         const { data: publicUrlData } = supabase.storage.from('scans').getPublicUrl(filePath);
-        imageUrls.push(publicUrlData.publicUrl);
-      }
+        return { error: null, file, publicUrl: publicUrlData.publicUrl };
+      })
+    );
+
+    // Check if any upload failed
+    const failedUpload = uploadResults.find((res) => res.error);
+    if (failedUpload) {
+      console.error('Supabase storage upload failed for', failedUpload.file.originalname, ':', failedUpload.error.message);
+      await supabase
+        .from('scans')
+        .update({
+          status: 'failed',
+          result: { error: `Image upload failed: ${failedUpload.error.message}` }
+        })
+        .eq('id', scanId);
+
+      return res.status(500).json({ error: `Image upload failed: ${failedUpload.error.message}` });
     }
+
+    const imageUrls = uploadResults.map((res) => res.publicUrl);
 
     // Update scan with actual image URLs
     await supabase.from('scans').update({ image_urls: imageUrls }).eq('id', scanId);
 
     // 5. Send to Image Processing Service
-    // Using a placeholder URL if not set in .env
-    const processingUrl = process.env.IMAGE_PROCESSING_URL || 'http://localhost:8080/process';
+    // Using a fallback URL if not set in .env
+    const processingUrl = process.env.IMAGE_PROCESSING_URL || 'http://127.0.0.1:8000/scan';
     let result = null;
     let finalStatus = 'failed';
 
@@ -103,7 +111,8 @@ export const createScan = async (req, res, next) => {
 
       const response = await fetch(processingUrl, {
         method: 'POST',
-        body: formData
+        body: formData,
+        signal: AbortSignal.timeout(240000)
       });
 
       if (response.ok) {
